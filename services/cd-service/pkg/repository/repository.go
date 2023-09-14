@@ -24,9 +24,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	v1alpha1 "github.com/freiheit-com/kuberpult/services/cd-service/pkg/argocd/v1alpha1"
-	"github.com/freiheit-com/kuberpult/services/cd-service/pkg/grpc"
-	"github.com/freiheit-com/kuberpult/services/cd-service/pkg/mapper"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -39,9 +36,14 @@ import (
 	"sync"
 	"time"
 
+	v1alpha1 "github.com/freiheit-com/kuberpult/services/cd-service/pkg/argocd/v1alpha1"
+	"github.com/freiheit-com/kuberpult/services/cd-service/pkg/grpc"
+	"github.com/freiheit-com/kuberpult/services/cd-service/pkg/mapper"
+
 	"github.com/DataDog/datadog-go/v5/statsd"
 	backoff "github.com/cenkalti/backoff/v4"
 	"github.com/freiheit-com/kuberpult/pkg/auth"
+	"github.com/freiheit-com/kuberpult/pkg/setup"
 	"github.com/freiheit-com/kuberpult/services/cd-service/pkg/argocd"
 	"github.com/freiheit-com/kuberpult/services/cd-service/pkg/config"
 	"github.com/freiheit-com/kuberpult/services/cd-service/pkg/fs"
@@ -175,6 +177,15 @@ func openOrCreate(path string, storageBackend StorageBackend) (*git.Repository, 
 
 // Opens a repository. The repository is initialized and updated in the background.
 func New(ctx context.Context, cfg RepositoryConfig) (Repository, error) {
+	repo, bg, err := New2(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	go bg(ctx, nil)
+	return repo, err
+}
+
+func New2(ctx context.Context, cfg RepositoryConfig) (Repository, setup.BackgroundFunc, error) {
 	logger := logger.FromContext(ctx)
 
 	ddMetricsFromCtx := ctx.Value("ddMetrics")
@@ -205,20 +216,20 @@ func New(ctx context.Context, cfg RepositoryConfig) (Repository, error) {
 	} else {
 		credentials, err = cfg.Credentials.load()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		certificates, err = cfg.Certificates.load()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	if repo2, err := openOrCreate(cfg.Path, cfg.StorageBackend); err != nil {
-		return nil, err
+		return nil, nil, err
 	} else {
 		// configure remotes
 		if remote, err := repo2.Remotes.CreateAnonymous(cfg.URL); err != nil {
-			return nil, err
+			return nil, nil, err
 		} else {
 			result := &repository{
 				config:          &cfg,
@@ -247,7 +258,7 @@ func New(ctx context.Context, cfg RepositoryConfig) (Repository, error) {
 			}
 			err := remote.Fetch([]string{fetchSpec}, &fetchOptions, "fetching")
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			var zero git.Oid
 			var rev *git.Oid = &zero
@@ -257,43 +268,48 @@ func New(ctx context.Context, cfg RepositoryConfig) (Repository, error) {
 					// not found
 					// nothing to do
 				} else {
-					return nil, err
+					return nil, nil, err
 				}
 			} else {
 				rev = remoteRef.Target()
 				if _, err := repo2.References.Create(fmt.Sprintf("refs/heads/%s", cfg.Branch), rev, true, "reset branch"); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 			}
 
 			// check that we can build the current state
 			state, err := result.StateAt(nil)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 
 			// Check configuration for errors and abort early if any:
 			_, err = state.GetEnvironmentConfigsAndValidate(ctx)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			go result.ProcessQueue(ctx)
-			return result, nil
+
+			return result, result.ProcessQueue, nil
 		}
 	}
 }
 
-func (r *repository) ProcessQueue(ctx context.Context) {
+func (r *repository) ProcessQueue(ctx context.Context, health *setup.HealthReporter) error {
 	defer func() {
 		close(r.queue.elements)
 		for e := range r.queue.elements {
 			e.result <- ctx.Err()
 		}
 	}()
+	health.ReportReady("processing queue")
+	tick, cancel := health.StartWatchDog(5 * time.Minute)
+	defer cancel()
 	for {
 		select {
+		case ping := <-tick:
+			ping.Pong()
 		case <-ctx.Done():
-			return
+			return nil
 		case e := <-r.queue.elements:
 			r.ProcessQueueOnce(ctx, e, defaultPushUpdate, DefaultPushActionCallback)
 		}
