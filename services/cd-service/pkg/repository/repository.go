@@ -301,13 +301,12 @@ func (r *repository) ProcessQueue(ctx context.Context, health *setup.HealthRepor
 			e.result <- ctx.Err()
 		}
 	}()
-	health.ReportReady("processing queue")
-	tick, cancel := health.StartWatchDog(5 * time.Minute)
-	defer cancel()
+	tick := time.Tick(r.config.NetworkTimeout)
 	for {
+		health.ReportReadyTtl("processing queue", 10 * r.config.NetworkTimeout)
 		select {
-		case ping := <-tick:
-			ping.Pong()
+		case <-tick:
+			// this triggers a for loop every `NetworkTimeout` to refresh the readyness
 		case <-ctx.Done():
 			return nil
 		case e := <-r.queue.elements:

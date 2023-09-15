@@ -20,7 +20,6 @@ Copyright 2023 freiheit.com*/
 package setup
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -36,74 +35,29 @@ const (
 	HealthFailed
 )
 
-type WatchDogPing struct {
-	pingTime time.Time
-	watchDog *watchDog
-}
-
-func (p *WatchDogPing) Pong() {
-	p.watchDog.gotPing(p.pingTime)
-}
-
-type watchDog struct {
-	ch          chan *WatchDogPing
-	cancel      context.CancelFunc
-	latency     time.Duration
-	missedPings uint
-}
-
-func (w *watchDog) gotPing(t time.Time) {
-	w.latency = time.Now().Sub(t)
-	w.missedPings = 0
-}
-
-func (w *watchDog) missedPing() {
-	w.missedPings = w.missedPings + 1
-}
-
-func newWatchDog(timeout time.Duration) *watchDog {
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := make(chan *WatchDogPing, 1)
-	wd := &watchDog{ch: ch, cancel: cancel}
-	go func() {
-		defer cancel()
-		ticker := time.Tick(timeout)
-		for {
-			select {
-			case t := <-ticker:
-				select {
-				case ch <- &WatchDogPing{t, wd}:
-				default:
-					wd.missedPing()
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return wd
-}
-
 type HealthReporter struct {
-	server   *HealthServer
-	name     string
-	watchDog *watchDog
+	server *HealthServer
+	name   string
 }
 
 type report struct {
-	Health  Health    `json:"health"`
-	Time    time.Time `json:"time"`
-	Message string    `json:"message"`
+	Health  Health        `json:"health"`
+	Time    time.Time     `json:"time"`
+	Ttl     time.Duration `json:"ttl"`
+	Message string        `json:"message"`
 }
+
+var TtlForever time.Duration = 0
 
 func (r *HealthReporter) ReportReady(message string) {
-	if r == nil {
-		return
-	}
-	r.ReportHealth(HealthReady, message)
+	r.ReportHealth(HealthReady, message, TtlForever)
 }
 
-func (r *HealthReporter) ReportHealth(health Health, message string) {
+func (r *HealthReporter) ReportReadyTtl(message string, ttl time.Duration) {
+	r.ReportHealth(HealthReady, message, ttl)
+}
+
+func (r *HealthReporter) ReportHealth(health Health, message string, ttl time.Duration) {
 	if r == nil {
 		return
 	}
@@ -115,16 +69,9 @@ func (r *HealthReporter) ReportHealth(health Health, message string) {
 	r.server.parts[r.name] = report{
 		Health:  health,
 		Time:    r.server.now(),
+		Ttl:     ttl,
 		Message: message,
 	}
-}
-
-func (r *HealthReporter) StartWatchDog(timeout time.Duration) (<-chan *WatchDogPing, context.CancelFunc) {
-	wd := newWatchDog(timeout)
-	if r != nil {
-		r.watchDog = wd
-	}
-	return wd.ch, wd.cancel
 }
 
 type HealthServer struct {
@@ -186,7 +133,7 @@ func (h *HealthServer) Reporter(name string) *HealthReporter {
 		server: h,
 		name:   name,
 	}
-	r.ReportHealth(HealthStarting, "starting")
+	r.ReportHealth(HealthStarting, "starting", 0)
 	return r
 }
 
